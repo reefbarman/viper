@@ -163,6 +163,9 @@ type Viper struct {
 	aliases        map[string]string
 	typeByDefValue bool
 
+	// Determines the order sources are looked in for values
+	sourcePriority []string
+
 	onConfigChange func(fsnotify.Event)
 }
 
@@ -180,6 +183,7 @@ func New() *Viper {
 	v.env = make(map[string]string)
 	v.aliases = make(map[string]string)
 	v.typeByDefValue = false
+	v.sourcePriority = []string{"overrides", "flags", "envvariables", "configfile", "kvstore", "defaults"}
 
 	return v
 }
@@ -289,6 +293,14 @@ func SetConfigFile(in string) { v.SetConfigFile(in) }
 func (v *Viper) SetConfigFile(in string) {
 	if in != "" {
 		v.configFile = in
+	}
+}
+
+// SetSourcePriority will override the order values are looked for in various sources
+func SetSourcePriority(in []string) { v. SetSourcePriority(in) }
+func (v *Viper) SetSourcePriority(in []string) {
+	if (len(in) != 0) {
+		v.sourcePriority = in
 	}
 }
 
@@ -861,7 +873,6 @@ func (v *Viper) find(lcaseKey string) interface{} {
 
 	var (
 		val    interface{}
-		exists bool
 		path   = strings.Split(lcaseKey, v.keyDelim)
 		nested = len(path) > 1
 	)
@@ -876,82 +887,93 @@ func (v *Viper) find(lcaseKey string) interface{} {
 	path = strings.Split(lcaseKey, v.keyDelim)
 	nested = len(path) > 1
 
-	// Set() override first
-	val = v.searchMap(v.override, path)
-	if val != nil {
-		return val
-	}
-	if nested && v.isPathShadowedInDeepMap(path, v.override) != "" {
-		return nil
-	}
-
-	// PFlag override next
-	flag, exists := v.pflags[lcaseKey]
-	if exists && flag.HasChanged() {
-		switch flag.ValueType() {
-		case "int", "int8", "int16", "int32", "int64":
-			return cast.ToInt(flag.ValueString())
-		case "bool":
-			return cast.ToBool(flag.ValueString())
-		case "stringSlice":
-			s := strings.TrimPrefix(flag.ValueString(), "[")
-			s = strings.TrimSuffix(s, "]")
-			res, _ := readAsCSV(s)
-			return res
+	for _, source := range v.sourcePriority {
+		switch source {
+		case "overrides":
+			// Set() override first
+			val = v.searchMap(v.override, path)
+			if val != nil {
+				return val
+			}
+			if nested && v.isPathShadowedInDeepMap(path, v.override) != "" {
+				return nil
+			}
+			break
+		case "flags":
+			// PFlag override next
+			flag, exists := v.pflags[lcaseKey]
+			if exists && flag.HasChanged() {
+				switch flag.ValueType() {
+				case "int", "int8", "int16", "int32", "int64":
+					return cast.ToInt(flag.ValueString())
+				case "bool":
+					return cast.ToBool(flag.ValueString())
+				case "stringSlice":
+					s := strings.TrimPrefix(flag.ValueString(), "[")
+					s = strings.TrimSuffix(s, "]")
+					res, _ := readAsCSV(s)
+					return res
+				default:
+					return flag.ValueString()
+				}
+			}
+			if nested && v.isPathShadowedInFlatMap(path, v.pflags) != "" {
+				return nil
+			}
+			break
+		case "envvariables":
+			// Env override next
+			if v.automaticEnvApplied {
+				// even if it hasn't been registered, if automaticEnv is used,
+				// check any Get request
+				if val = v.getEnv(v.mergeWithEnvPrefix(lcaseKey)); val != "" {
+					return val
+				}
+				if nested && v.isPathShadowedInAutoEnv(path) != "" {
+					return nil
+				}
+			}
+			envkey, exists := v.env[lcaseKey]
+			if exists {
+				if val = v.getEnv(envkey); val != "" {
+					return val
+				}
+			}
+			if nested && v.isPathShadowedInFlatMap(path, v.env) != "" {
+				return nil
+			}
+			break
+		case "configfile":
+			// Config file next
+			val = v.searchMapWithPathPrefixes(v.config, path)
+			if val != nil {
+				return val
+			}
+			if nested && v.isPathShadowedInDeepMap(path, v.config) != "" {
+				return nil
+			}
+			break
+		case "kvstore":
+			// K/V store next
+			val = v.searchMap(v.kvstore, path)
+			if val != nil {
+				return val
+			}
+			if nested && v.isPathShadowedInDeepMap(path, v.kvstore) != "" {
+				return nil
+			}
+			break
 		default:
-			return flag.ValueString()
+			// Default next
+			val = v.searchMap(v.defaults, path)
+			if val != nil {
+				return val
+			}
+			if nested && v.isPathShadowedInDeepMap(path, v.defaults) != "" {
+				return nil
+			}
+			break
 		}
-	}
-	if nested && v.isPathShadowedInFlatMap(path, v.pflags) != "" {
-		return nil
-	}
-
-	// Env override next
-	if v.automaticEnvApplied {
-		// even if it hasn't been registered, if automaticEnv is used,
-		// check any Get request
-		if val = v.getEnv(v.mergeWithEnvPrefix(lcaseKey)); val != "" {
-			return val
-		}
-		if nested && v.isPathShadowedInAutoEnv(path) != "" {
-			return nil
-		}
-	}
-	envkey, exists := v.env[lcaseKey]
-	if exists {
-		if val = v.getEnv(envkey); val != "" {
-			return val
-		}
-	}
-	if nested && v.isPathShadowedInFlatMap(path, v.env) != "" {
-		return nil
-	}
-
-	// Config file next
-	val = v.searchMapWithPathPrefixes(v.config, path)
-	if val != nil {
-		return val
-	}
-	if nested && v.isPathShadowedInDeepMap(path, v.config) != "" {
-		return nil
-	}
-
-	// K/V store next
-	val = v.searchMap(v.kvstore, path)
-	if val != nil {
-		return val
-	}
-	if nested && v.isPathShadowedInDeepMap(path, v.kvstore) != "" {
-		return nil
-	}
-
-	// Default next
-	val = v.searchMap(v.defaults, path)
-	if val != nil {
-		return val
-	}
-	if nested && v.isPathShadowedInDeepMap(path, v.defaults) != "" {
-		return nil
 	}
 
 	// last chance: if no other value is returned and a flag does exist for the value,
